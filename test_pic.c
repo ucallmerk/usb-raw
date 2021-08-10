@@ -12,6 +12,10 @@ int main (int argc, char *argv[])
 	if(!fd)
 		printf("** failed to open device");
 
+	fprintf("Opened device for reading\n");
+
+	fscanf("%d",&i);
+
 	fread(buf, 1, buf_len, fd);
 
 	for (i=0; i<buf_len; i++)
