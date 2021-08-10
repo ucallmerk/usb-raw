@@ -39,6 +39,7 @@ struct usb_pic32 {
 	struct urb	*in_urb;
 	struct urb	*out_urb;
 	char		*in_buff;
+	bool		data_in;
 	dma_addr_t	in_dma;
 	char		*out_buff;
 	dma_addr_t	out_dma;
@@ -83,6 +84,8 @@ static void pic32_usb_in_callback(struct urb *urb)
 			 "Received %d bytes\n", urb->actual_length);
 
 		memcpy(read_buffer, dev->in_buff, urb->actual_length);
+
+		dev->data_in = true;
 	}
 
 resubmit:
@@ -189,6 +192,7 @@ static int pic32_usb_open (struct inode *inode, struct file *file)
 
 	dev->int_in_running = 1;
 	dev->int_in_done = 0;
+	dev->data_in = false;
 
 	retval = usb_submit_urb(dev->in_urb, GFP_KERNEL);
 	if (retval) {
@@ -232,6 +236,9 @@ int pic32_usb_release (struct inode *inode, struct file *file)
 		goto unlock_exit;
 	}
 
+	if(read_buffer)
+		kfree(read_buffer);
+
 	dev->open_count = 0;
 
 unlock_exit:
@@ -243,11 +250,28 @@ exit:
 
 static ssize_t pic32_usb_read(struct file *file, char __user *buffer, size_t count, loff_t *ppos)
 {
-	size_t min = 0;
-	min = min(count, sizeof(read_buffer));
+	int retval = 0;
+	size_t bytes_to_read = 0;
+	struct usb_pic32 *dev = file->private_data;
+
+	while (!dev->data_in) {
+		dev->int_in_done = 0;
+		if (file->f_flags & O_NONBLOCK) {
+			retval = -EAGAIN;
+			goto exit;
+		}
+		retval = wait_event_interruptible(dev->read_wait, dev->int_in_done);
+		if (retval < 0)
+			goto exit;
+	}
+
+	bytes_to_read = min(count, sizeof(read_buffer));
 	printk(KERN_ERR " ** read buff size %ld\n", sizeof(read_buffer));
-	copy_to_user(buffer, read_buffer, count);
-	return 0;
+
+	if( copy_to_user(buffer, read_buffer, bytes_to_read))
+		retval = -EFAULT;
+exit:
+	return retval;
 }
 
 static ssize_t pic32_usb_write (struct file *file, const char __user *buffer, size_t count, loff_t *ppos)
@@ -289,6 +313,7 @@ int pic32_usb_probe(struct usb_interface *intf,
 	if (!usb_endpoint_is_int_in(endpoint))
 		return -ENODEV;
 
+	pipe = usb_rcvintpipe(udev, endpoint->bEndpointAddress);
 	maxp = usb_maxpacket(udev, pipe, usb_pipein(pipe));
 
 	/* Allocate local dev sturcture */
@@ -309,8 +334,6 @@ int pic32_usb_probe(struct usb_interface *intf,
 	if(!pic_dev->in_urb)
 		goto error;
 
-	pipe = usb_rcvintpipe(udev, endpoint->bEndpointAddress);
-
 	usb_fill_int_urb(pic_dev->in_urb, udev, pipe,
 			 pic_dev->in_buff, pic_dev->ep_in_maxp_sz,
 			 pic32_usb_in_callback,
@@ -322,6 +345,7 @@ int pic32_usb_probe(struct usb_interface *intf,
 	if (!usb_endpoint_is_int_out(endpoint))
 		return -ENODEV;
 
+	pipe = usb_sndintpipe(udev, endpoint->bEndpointAddress);
 	maxp = usb_maxpacket(udev, pipe, usb_pipeout(pipe));
 
 	pic_dev->ep_out = endpoint;
@@ -340,7 +364,6 @@ int pic32_usb_probe(struct usb_interface *intf,
 	if(!pic_dev->out_urb)
 		goto error;
 
-	pipe = usb_sndintpipe(udev, endpoint->bEndpointAddress);
 
 	usb_fill_int_urb(pic_dev->out_urb, udev, pipe,
 			 pic_dev->out_buff, pic_dev->ep_out_maxp_sz,
@@ -377,7 +400,22 @@ error:
 
 void pic32_usb_disconnect(struct usb_interface *intf)
 {
+	struct usb_pic32 *pic_dev = usb_get_intfdata(intf);
+	struct usb_device *udev = interface_to_usbdev(intf);
+
+	/* let us free memory */
+	if(pic_dev->in_buff)
+		usb_free_coherent(udev,
+			PIC32_INT_BUFF_SZ, pic_dev->in_buff, pic_dev->in_dma);
+	if(pic_dev->in_urb)
+		usb_free_urb(pic_dev->in_urb);
+
+	kfree(pic_dev);
+
 	pr_info(" PIC32 USB DRIVER - Device disconnected.. \n");
+
+	/* de-register driver */
+	usb_deregister_dev(intf, &pic32_usb_class);
 }
 
 static struct usb_driver pic32_usb_driver = {
