@@ -54,7 +54,6 @@ struct usb_pic32 {
 	bool		disconnected;
 
 	wait_queue_head_t	read_wait;
-	wait_queue_head_t	write_wait;
 };
 
 static struct usb_driver pic32_usb_driver;
@@ -121,7 +120,7 @@ static int pic32_usb_open (struct inode *inode, struct file *file)
 	urb = usb_alloc_urb(0, GFP_KERNEL);
 	if (!urb) {
 		retval = -ENOMEM;
-		goto error_1;
+		goto unlock_exit;
 	}
 
 	udev = interface_to_usbdev(interface);
@@ -152,12 +151,10 @@ static int pic32_usb_open (struct inode *inode, struct file *file)
 
 #endif
 
-unlock_exit:
-	mutex_unlock(&dev->mutex);
-	return retval;
 error_3:
 	usb_free_urb(urb);
-error_1:
+unlock_exit:
+	mutex_unlock(&dev->mutex);
 	return retval;
 }
 
@@ -243,7 +240,6 @@ static ssize_t pic32_usb_write (struct file *file, const char __user *buffer, si
 	struct usb_device *udev = interface_to_usbdev(interface);
 	char *buf;
 	int retval = 0, ret = 0;
-	struct urb *urb;
 	int skipped_report_id = 0;
 	int actual_length = 0;
 
@@ -293,9 +289,7 @@ unlock_exit:
 exit:
 	return count;
 	kfree(buf);
-	//usb_free_coherent(udev, count, buf, urb->transfer_dma);
 error_2:
-	usb_free_urb(urb);
 	return retval;
 
 }
@@ -324,7 +318,6 @@ void pic32_usb_free( struct usb_pic32 *dev)
 		PIC32_INT_BUFF_SZ, dev->in_buff, dev->in_dma);
 	usb_free_coherent(udev,
 		PIC32_INT_BUFF_SZ, dev->out_buff, dev->out_dma);
-	kfree(dev);
 }
 
 int pic32_usb_probe(struct usb_interface *intf,
@@ -347,7 +340,6 @@ int pic32_usb_probe(struct usb_interface *intf,
 
 	dev->intf = intf;
 	init_waitqueue_head(&dev->read_wait);
-	init_waitqueue_head(&dev->write_wait);
 
 	ret = usb_find_common_endpoints(interface,
 			NULL, NULL, &dev->ep_in, &dev->ep_out);
@@ -394,7 +386,7 @@ error:
 
 }
 
-void pic32_usb_disconnect(struct usb_interface *intf)
+static void pic32_usb_disconnect(struct usb_interface *intf)
 {
 	struct usb_pic32 *dev = usb_get_intfdata(intf);
 	int minor;
@@ -409,16 +401,11 @@ void pic32_usb_disconnect(struct usb_interface *intf)
 
 	/* if the device is not opened, then we clean up right now */
 	if (!dev->open_count) {
+		pic32_usb_free(dev);
 		mutex_unlock(&dev->mutex);
-		/* let us free memory */
-		if(dev->in_buff)
-			kfree(dev->in_buff);
-		if(dev->in_urb)
-			usb_free_urb(dev->in_urb);
-
 	} else {
 		dev->disconnected = 1;
-		/* wake up pollers */
+		wake_up_interruptible_all(&dev->read_wait);
 		mutex_unlock(&dev->mutex);
 	}
 
