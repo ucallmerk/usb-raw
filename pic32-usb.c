@@ -11,17 +11,15 @@
 #include <linux/usb.h>
 #include <linux/poll.h>
 
-#define MC_VENDOR_ID 0x1c4f
-#define PIC_PRODUCT_ID 0x0003
-#define USB_PIC32_MINOR_BASE 0
-#define PIC32_INT_BUFF_SZ 65
-#define KEYBOARD_COMMAND_READ_KEY 0x80
-#define KEYBOARD_COMMAND_SET_LED 0x81
+//Bus 001 Device 006: ID 04d8:003f Microchip Technology, Inc.
+#define MC_VENDOR_ID		0x04d8
+#define PIC_PRODUCT_ID		0x003f
+#define USB_PIC32_MINOR_BASE	0
+#define PIC32_INT_BUFF_SZ	64
+#define USB_CTRL_SET_TIMEOUT	5000
 
-/* Using mini interval for in an dout transfers */
-static int in_intvl = 1;
-static int out_intvl = 1;
-static char *read_buffer;
+/* interval in micro frames */
+static int in_intvl = 8;
 
 const struct usb_device_id pic32_id_table[] = {
 
@@ -29,12 +27,13 @@ const struct usb_device_id pic32_id_table[] = {
 	{}
 };
 
-
 struct usb_pic32 {
 	struct usb_interface *intf;
 	struct usb_endpoint_descriptor *ep_in;
+	int		in_pipe;
 	int		ep_in_maxp_sz;
 	struct usb_endpoint_descriptor *ep_out;
+	int		out_pipe;
 	int		ep_out_maxp_sz;
 	struct urb	*in_urb;
 	struct urb	*out_urb;
@@ -51,6 +50,8 @@ struct usb_pic32 {
 	int		int_in_done;
 	int		int_out_running;
 	int		int_out_done;
+	bool		interrupt_out_busy;
+	bool		disconnected;
 
 	wait_queue_head_t	read_wait;
 	wait_queue_head_t	write_wait;
@@ -58,95 +59,32 @@ struct usb_pic32 {
 
 static struct usb_driver pic32_usb_driver;
 
-static void pic32_usb_in_callback(struct urb *urb)
+static void pic32_usb_read_callback(struct urb *urb)
 {
 	struct usb_pic32 *dev = urb->context;
 	int status = urb->status;
-	int retval = 0;
 
-	dev_info(&dev->intf->dev,"In call back\n");
-
-	if (status) {
-		if (status == -ENOENT ||
-		    status == -ECONNRESET ||
-		    status == -ESHUTDOWN) {
-			goto exit;
-		} else {
-			dev_dbg(&dev->intf->dev,
-				"%s: nonzero status received: %d\n", __func__,
-				status);
-			goto resubmit;
-		}
+	if (status && !(status == -ENOENT || status == -ECONNRESET ||
+			status == -ESHUTDOWN)) {
+		dev_err(&dev->intf->dev,
+			"urb=%p read int status received: %d\n", urb, status);
 	}
 
-	if (urb->actual_length > 0) {
-		dev_info(&dev->intf->dev,
-			 "Received %d bytes\n", urb->actual_length);
-
-		memcpy(read_buffer, dev->in_buff, urb->actual_length);
-
-		dev->data_in = true;
-	}
-
-resubmit:
-	/* resubmit if we're still running */
-	if (dev->int_in_running) {
-		retval = usb_submit_urb(dev->in_urb, GFP_ATOMIC);
-		if (retval) {
-			dev_err(&dev->intf->dev,
-				"usb_submit_urb failed (%d)\n", retval);
-		}
-	}
-exit:
+	dev->data_in =1;
 	dev->int_in_done = 1;
 	wake_up_interruptible(&dev->read_wait);
+
 }
-
-static void pic32_usb_out_callback(struct urb *urb)
-{
-	struct usb_pic32 *dev = urb->context;
-	int status = urb->status;
-	int retval = 0;
-
-	dev_info(&dev->intf->dev,"Out call back\n ");
-
-	if (status) {
-		if (status == -ENOENT ||
-		    status == -ECONNRESET ||
-		    status == -ESHUTDOWN) {
-			goto exit;
-		} else {
-			dev_dbg(&dev->intf->dev,
-				"%s: nonzero status received: %d\n", __func__,
-				status);
-			goto resubmit;
-		}
-	}
-
-resubmit:
-	/* resubmit if we're still running */
-	if (dev->int_out_running) {
-		retval = usb_submit_urb(dev->out_urb, GFP_ATOMIC);
-		if (retval) {
-			dev_err(&dev->intf->dev,
-				"usb_submit_urb failed (%d)\n", retval);
-		}
-	}
-exit:
-	dev->int_out_done = 1;
-	wake_up_interruptible(&dev->write_wait);
-}
-
-
 
 static int pic32_usb_open (struct inode *inode, struct file *file)
 {
-	struct usb_pic32 *dev;
-	struct usb_device *udev;
+	struct usb_pic32 *dev = file->private_data;
 	struct usb_interface *interface;
-	struct usb_endpoint_descriptor *endpoint;
+	struct usb_device *udev;
+	struct urb *urb;
 	int subminor;
-	int retval;
+	int retval = 0;
+
 
 	nonseekable_open(inode, file);
 	subminor = iminor(inode);
@@ -175,53 +113,58 @@ static int pic32_usb_open (struct inode *inode, struct file *file)
 	}
 	dev->open_count = 1;
 
-	udev = interface_to_usbdev(interface);
-	endpoint = dev->ep_in;
-
-	dev->int_out_running = 1;
-	dev->int_out_done = 0;
-	retval = usb_submit_urb(dev->out_urb, GFP_KERNEL);
-	if (retval) {
-		dev_err(&interface->dev,
-			"Couldn't submit out_urb %d\n", retval);
-		dev->int_out_running = 0;
-		dev->open_count = 0;
-		goto unlock_exit;
-	}
-	dev_info (&interface->dev, "Submitted out URB\n");
-
-	dev->int_in_running = 1;
-	dev->int_in_done = 0;
-	dev->data_in = false;
-
-	retval = usb_submit_urb(dev->in_urb, GFP_KERNEL);
-	if (retval) {
-		dev_err(&interface->dev,
-			"Couldn't submit in_urb %d\n", retval);
-		dev->int_in_running = 0;
-		dev->open_count = 0;
-		goto unlock_exit;
-	}
-	dev_info (&interface->dev, "Submitted URB for endpoint in dir setup\n");
-
-	read_buffer = kmalloc(PIC32_INT_BUFF_SZ, GFP_KERNEL);
-	if(!read_buffer)
-		retval = -ENOMEM;
-
 	/* save device in the file's private structure */
 	file->private_data = dev;
+
+#if 1
+	/* alloc urb, fillit, submit.. don't wait..*/
+	urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!urb) {
+		retval = -ENOMEM;
+		goto error_1;
+	}
+
+	udev = interface_to_usbdev(interface);
+
+	usb_fill_int_urb(urb,
+			 udev,
+			 dev->in_pipe,
+			 dev->in_buff,
+			 dev->ep_in_maxp_sz,
+			 pic32_usb_read_callback,
+			 dev,
+			 in_intvl);
+
+	urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+	urb->transfer_dma = dev->in_dma;
+
+	dev->int_in_running = 1;
+	dev->int_in_done =0;
+	dev->data_in = 0;
+	retval = usb_submit_urb(urb, GFP_KERNEL);
+	if (retval) {
+		dev->int_in_running = 0;
+		dev->int_in_done = 1;
+		dev_err(&dev->intf->dev,
+			"failed submitting read urb, error %d\n", retval);
+		goto error_3;
+	}
+
+#endif
 
 unlock_exit:
 	mutex_unlock(&dev->mutex);
 	return retval;
-
+error_3:
+	usb_free_urb(urb);
+error_1:
+	return retval;
 }
 
 int pic32_usb_release (struct inode *inode, struct file *file)
 {
 	struct usb_pic32 *dev;
 	int retval = 0;
-
 	dev = file->private_data;
 
 	if (dev == NULL) {
@@ -235,10 +178,6 @@ int pic32_usb_release (struct inode *inode, struct file *file)
 		retval = -ENODEV;
 		goto unlock_exit;
 	}
-
-	if(read_buffer)
-		kfree(read_buffer);
-
 	dev->open_count = 0;
 
 unlock_exit:
@@ -254,29 +193,111 @@ static ssize_t pic32_usb_read(struct file *file, char __user *buffer, size_t cou
 	size_t bytes_to_read = 0;
 	struct usb_pic32 *dev = file->private_data;
 
-	while (!dev->data_in) {
-		dev->int_in_done = 0;
-		if (file->f_flags & O_NONBLOCK) {
-			retval = -EAGAIN;
-			goto exit;
-		}
-		retval = wait_event_interruptible(dev->read_wait, dev->int_in_done);
-		if (retval < 0)
-			goto exit;
+	if (count == 0)
+		goto exit;
+
+	/* lock this object */
+	if (mutex_lock_interruptible(&dev->mutex)) {
+		retval = -ERESTARTSYS;
+		goto exit;
 	}
 
-	bytes_to_read = min(count, sizeof(read_buffer));
-	printk(KERN_ERR " ** read buff size %ld\n", sizeof(read_buffer));
+	/* verify that the device wasn't unplugged */
+	if (dev->disconnected) {
+		retval = -ENODEV;
+		printk(KERN_ERR "pic32 usb: No device or device unplugged %d\n", retval);
+		goto unlock_exit;
+	}
 
-	if( copy_to_user(buffer, read_buffer, bytes_to_read))
+	while(!dev->data_in) {
+
+		if (file->f_flags & O_NONBLOCK) {
+	            retval = -EAGAIN;
+                    goto unlock_exit;
+		}
+
+		retval = wait_event_interruptible(dev->read_wait, dev->int_in_done);
+		if (retval < 0)
+			goto unlock_exit;
+	}
+	bytes_to_read = min(count, (size_t) dev->ep_in_maxp_sz);
+	retval = bytes_to_read;
+
+	if( copy_to_user(buffer, dev->in_buff, bytes_to_read))
 		retval = -EFAULT;
+#if 0 /* Print buffer */
+	int i;
+	for (i=0; i<bytes_to_read; i++)
+		printk("0x%2x ", dev->in_buff[i]);
+#endif
+unlock_exit:
+	mutex_unlock(&dev->mutex);
 exit:
 	return retval;
 }
 
 static ssize_t pic32_usb_write (struct file *file, const char __user *buffer, size_t count, loff_t *ppos)
 {
-	return 0;
+	struct usb_pic32 *dev = file->private_data;
+	struct usb_interface *interface = dev->intf;
+	struct usb_device *udev = interface_to_usbdev(interface);
+	char *buf;
+	int retval = 0, ret = 0;
+	struct urb *urb;
+	int skipped_report_id = 0;
+	int actual_length = 0;
+
+	if (count == 0) {
+		printk(KERN_ERR "PIC32: %s : Cannot write 0 bytes..\n",__func__);
+		goto exit;
+	}
+
+	/* lock this object */
+	if (mutex_lock_interruptible(&dev->mutex)) {
+		retval = -ERESTARTSYS;
+		goto exit;
+	}
+
+	/* verify that the device wasn't unplugged */
+	if (dev->disconnected) {
+		retval = -ENODEV;
+		printk(KERN_ERR "pic32 usb: No device or device unplugged %d\n", retval);
+		goto unlock_exit;
+	}
+
+	buf = memdup_user(buffer, count);
+	if (IS_ERR(buf)) {
+		ret = PTR_ERR(buf);
+		goto error_2;
+	}
+	if (buf[0] == 0x0) {
+		/* Don't send the Report ID */
+		buf++;
+		count--;
+		skipped_report_id = 1;
+	}
+
+	ret = usb_interrupt_msg(udev, dev->out_pipe,
+				buf, count, &actual_length,
+				USB_CTRL_SET_TIMEOUT);
+	/* return the number of bytes transferred */
+	if (ret == 0) {
+		ret = actual_length;
+		/* count also the report id */
+		if (skipped_report_id)
+			ret++;
+	}
+
+unlock_exit:
+	mutex_unlock(&dev->mutex);
+exit:
+	return count;
+	kfree(buf);
+	//usb_free_coherent(udev, count, buf, urb->transfer_dma);
+error_2:
+	usb_free_urb(urb);
+	return retval;
+
 }
 
 /* file operations needed when we register this driver */
@@ -294,14 +315,24 @@ static struct usb_class_driver pic32_usb_class = {
 	.minor_base =	USB_PIC32_MINOR_BASE,
 };
 
+void pic32_usb_free( struct usb_pic32 *dev)
+{
+	struct usb_interface *interface = dev->intf;
+	struct usb_device *udev = interface_to_usbdev(interface);
+
+	usb_free_coherent(udev,
+		PIC32_INT_BUFF_SZ, dev->in_buff, dev->in_dma);
+	usb_free_coherent(udev,
+		PIC32_INT_BUFF_SZ, dev->out_buff, dev->out_dma);
+	kfree(dev);
+}
+
 int pic32_usb_probe(struct usb_interface *intf,
 		   const struct usb_device_id *id)
 {
 	struct usb_device *udev = interface_to_usbdev(intf);
 	struct usb_host_interface *interface = NULL;
-	struct usb_endpoint_descriptor *endpoint = NULL;
-	struct usb_pic32 *pic_dev = NULL;
-	int pipe, maxp;
+	struct usb_pic32 *dev = NULL;
 	int ret = -ENOMEM;
 
 	interface = intf->cur_altsetting;
@@ -309,68 +340,41 @@ int pic32_usb_probe(struct usb_interface *intf,
 	if (interface->desc.bNumEndpoints != 2)
 		return -ENODEV;
 
-	endpoint = &interface->endpoint[0].desc;
-	if (!usb_endpoint_is_int_in(endpoint))
-		return -ENODEV;
-
-	pipe = usb_rcvintpipe(udev, endpoint->bEndpointAddress);
-	maxp = usb_maxpacket(udev, pipe, usb_pipein(pipe));
-
 	/* Allocate local dev sturcture */
-	pic_dev = kzalloc(sizeof(struct usb_pic32), GFP_KERNEL);
-	if (!pic_dev)
+	dev = kzalloc(sizeof(struct usb_pic32), GFP_KERNEL);
+	if (!dev)
 		goto exit;
 
-	pic_dev->intf = intf;
-	pic_dev->ep_in = endpoint;
-	pic_dev->ep_in_maxp_sz = maxp;
+	dev->intf = intf;
+	init_waitqueue_head(&dev->read_wait);
+	init_waitqueue_head(&dev->write_wait);
 
-	pic_dev->in_buff = usb_alloc_coherent(udev,
-				PIC32_INT_BUFF_SZ, GFP_ATOMIC, &pic_dev->in_dma);
-	if(!pic_dev->in_buff)
+	ret = usb_find_common_endpoints(interface,
+			NULL, NULL, &dev->ep_in, &dev->ep_out);
+
+	if (ret) {
+		dev_err(&intf->dev, "Could not find both bulk-in and bulk-out endpoints\n");
+		goto error;
+	}
+
+	dev->in_pipe = usb_rcvintpipe(udev, dev->ep_in->bEndpointAddress);
+	dev->ep_in_maxp_sz = usb_endpoint_maxp(dev->ep_in);
+
+	dev->in_buff = usb_alloc_coherent(udev,
+				PIC32_INT_BUFF_SZ, GFP_ATOMIC, &dev->in_dma);
+	if(!dev->in_buff) {
+		ret = -ENOMEM;
+		goto error;
+	}
+
+	dev->out_pipe = usb_sndintpipe(udev, dev->ep_out->bEndpointAddress);
+	dev->ep_out_maxp_sz = usb_endpoint_maxp(dev->ep_out);
+	dev->out_buff = usb_alloc_coherent(udev,
+				PIC32_INT_BUFF_SZ, GFP_ATOMIC, &dev->out_dma);
+	if(!dev->out_buff)
 		goto error;
 
-	pic_dev->in_urb = usb_alloc_urb(0, GFP_KERNEL);
-	if(!pic_dev->in_urb)
-		goto error;
-
-	usb_fill_int_urb(pic_dev->in_urb, udev, pipe,
-			 pic_dev->in_buff, pic_dev->ep_in_maxp_sz,
-			 pic32_usb_in_callback,
-			 pic_dev, in_intvl);
-
-
-	/* Set int out endpoint */
-	endpoint = &interface->endpoint[1].desc;
-	if (!usb_endpoint_is_int_out(endpoint))
-		return -ENODEV;
-
-	pipe = usb_sndintpipe(udev, endpoint->bEndpointAddress);
-	maxp = usb_maxpacket(udev, pipe, usb_pipeout(pipe));
-
-	pic_dev->ep_out = endpoint;
-	pic_dev->ep_out_maxp_sz = maxp;
-
-	pic_dev->out_buff = usb_alloc_coherent(udev,
-				PIC32_INT_BUFF_SZ, GFP_ATOMIC, &pic_dev->out_dma);
-	if(!pic_dev->out_buff)
-		goto error;
-
-	/* set up out buff */
-	pic_dev->out_buff[0] = 0x0;
-	pic_dev->out_buff[1] = KEYBOARD_COMMAND_READ_KEY;
-
-	pic_dev->out_urb = usb_alloc_urb(0, GFP_KERNEL);
-	if(!pic_dev->out_urb)
-		goto error;
-
-
-	usb_fill_int_urb(pic_dev->out_urb, udev, pipe,
-			 pic_dev->out_buff, pic_dev->ep_out_maxp_sz,
-			 pic32_usb_out_callback,
-			 pic_dev, out_intvl);
-
-	usb_set_intfdata(intf, pic_dev);
+	usb_set_intfdata(intf, dev);
 
 	ret = usb_register_dev(intf, &pic32_usb_class);
 	if (ret) {
@@ -385,37 +389,41 @@ int pic32_usb_probe(struct usb_interface *intf,
 		(intf->minor - USB_PIC32_MINOR_BASE), USB_MAJOR, intf->minor);
 
 exit:
-	return ret;
 error:
-	/* let us free memory */
-	if(pic_dev->in_buff)
-		usb_free_coherent(udev,
-			PIC32_INT_BUFF_SZ, pic_dev->in_buff, pic_dev->in_dma);
-	if(pic_dev->in_urb)
-		usb_free_urb(pic_dev->in_urb);
-	kfree(pic_dev);
 	return ret;
 
 }
 
 void pic32_usb_disconnect(struct usb_interface *intf)
 {
-	struct usb_pic32 *pic_dev = usb_get_intfdata(intf);
-	struct usb_device *udev = interface_to_usbdev(intf);
+	struct usb_pic32 *dev = usb_get_intfdata(intf);
+	int minor;
 
-	/* let us free memory */
-	if(pic_dev->in_buff)
-		usb_free_coherent(udev,
-			PIC32_INT_BUFF_SZ, pic_dev->in_buff, pic_dev->in_dma);
-	if(pic_dev->in_urb)
-		usb_free_urb(pic_dev->in_urb);
+	minor = intf->minor;
+	usb_set_intfdata(intf, NULL);
 
-	kfree(pic_dev);
-
-	pr_info(" PIC32 USB DRIVER - Device disconnected.. \n");
-
-	/* de-register driver */
+	/* give back our minor */
 	usb_deregister_dev(intf, &pic32_usb_class);
+
+	mutex_lock(&dev->mutex);
+
+	/* if the device is not opened, then we clean up right now */
+	if (!dev->open_count) {
+		mutex_unlock(&dev->mutex);
+		/* let us free memory */
+		if(dev->in_buff)
+			kfree(dev->in_buff);
+		if(dev->in_urb)
+			usb_free_urb(dev->in_urb);
+
+	} else {
+		dev->disconnected = 1;
+		/* wake up pollers */
+		mutex_unlock(&dev->mutex);
+	}
+
+	dev_info(&intf->dev, "PIC32 USB Device #%d now disconnected\n",
+		 (minor - USB_PIC32_MINOR_BASE));
 }
 
 static struct usb_driver pic32_usb_driver = {
@@ -427,7 +435,7 @@ static struct usb_driver pic32_usb_driver = {
 
 module_usb_driver(pic32_usb_driver);
 
-MODULE_DESCRIPTION("USB pic32");
+MODULE_DESCRIPTION("USB PIC32");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR(" RK ");
 MODULE_DEVICE_TABLE(usb, pic32_id_table);
