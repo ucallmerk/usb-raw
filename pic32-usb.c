@@ -10,6 +10,8 @@
 #include <linux/input.h>
 #include <linux/usb.h>
 #include <linux/poll.h>
+#include <linux/kfifo.h>
+#include <linux/proc_fs.h>
 
 //Bus 001 Device 006: ID 04d8:003f Microchip Technology, Inc.
 #define MC_VENDOR_ID		0x04d8
@@ -18,8 +20,26 @@
 #define PIC32_INT_BUFF_SZ	64
 #define USB_CTRL_SET_TIMEOUT	5000
 
+
+/* FIFO Defines */
+
+static struct kfifo pic32_fifo;
+
+#define FIFO_SIZE	256
+#define	PROC_FIFO	"pic32_input"
+#define KEY_BUTTON_LOC 	1
+#define NR_BUTTONS 8
+
+static DEFINE_MUTEX(fread_lock);
+
+static DEFINE_MUTEX(fwrite_lock);
+
+
 /* interval in micro frames */
 static int in_intvl = 8;
+char ascii_map_base = 0x41;/* A */
+char ascii_buf[NR_BUTTONS];
+static bool key_pressed = false;
 
 const struct usb_device_id pic32_id_table[] = {
 
@@ -54,7 +74,50 @@ struct usb_pic32 {
 	bool		disconnected;
 
 	wait_queue_head_t	read_wait;
+	struct kfifo	*fifo;
 };
+
+
+static void pic32_usb_process_buffer(const char* buffer)
+{
+	unsigned char buf;
+	unsigned char i,j;
+
+	buf = buffer[KEY_BUTTON_LOC];
+	for (i=0,j=0; i<8; i++) {
+		if((short)buf & (short)(1<<i)) {
+			ascii_buf[j++] = ascii_map_base + i;
+			key_pressed = true;
+		}
+	}
+	kfifo_in(&pic32_fifo, ascii_buf, j);
+}
+
+/* Virtual kbd structures */
+
+ssize_t pic32_input_read(struct device *dev, struct device_attribute *attr,  char *buf)
+{
+	int i;
+
+	if(key_pressed) {
+		key_pressed = 0;
+		return sprintf(buf, "%s\n", ascii_buf);
+	}
+	return 0;
+}
+
+ssize_t pic32_input_write(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+	return 0;
+}
+
+const struct device_attribute pic32_attr = {
+	.attr = {.name = "pic32_input", .mode = 0444},
+	.show = pic32_input_read,
+	.store = pic32_input_write,
+};
+
+
 
 static struct usb_driver pic32_usb_driver;
 
@@ -71,6 +134,7 @@ static void pic32_usb_read_callback(struct urb *urb)
 
 	dev->data_in =1;
 	dev->int_in_done = 1;
+	pic32_usb_process_buffer(urb->transfer_buffer);
 	wake_up_interruptible(&dev->read_wait);
 
 }
@@ -222,6 +286,7 @@ static ssize_t pic32_usb_read(struct file *file, char __user *buffer, size_t cou
 
 	if( copy_to_user(buffer, dev->in_buff, bytes_to_read))
 		retval = -EFAULT;
+
 #if 0 /* Print buffer */
 	int i;
 	for (i=0; i<bytes_to_read; i++)
@@ -293,6 +358,42 @@ error_2:
 	return retval;
 
 }
+
+static ssize_t fifo_write(struct file *file, const char __user *buf,
+						size_t count, loff_t *ppos)
+{
+	return 0;
+}
+static ssize_t fifo_read(struct file *file, char __user *buf,
+						size_t count, loff_t *ppos)
+{
+	int ret;
+	unsigned int copied;
+	if (mutex_lock_interruptible(&fread_lock))
+		return -ERESTARTSYS;
+	ret = kfifo_to_user(&pic32_fifo, buf, count, &copied);
+	mutex_unlock(&fread_lock);
+	return ret ? ret : copied;
+
+}
+
+int fifo_open(struct inode *inode, struct file *file)
+{
+	return 0;
+}
+#if 0 /* For kernel >5.0 */
+static const struct proc_ops fifo_fops = {
+	.proc_open		= fifo_open,
+	.proc_read		= fifo_read,
+	.proc_write		= fifo_write,
+	.proc_lseek		= noop_llseek,
+};
+#endif
+static const struct file_operations fifo_fops = {
+	.read		= fifo_read,
+	.write		= fifo_write,
+	.llseek		= noop_llseek,
+};
 
 /* file operations needed when we register this driver */
 static const struct file_operations pic32_usb_fops = {
@@ -368,12 +469,27 @@ int pic32_usb_probe(struct usb_interface *intf,
 
 	usb_set_intfdata(intf, dev);
 
+//	ret = device_create_file(&intf->dev, &pic32_attr);
+
 	ret = usb_register_dev(intf, &pic32_usb_class);
 	if (ret) {
 		/* something prevented us from registering this driver */
 		dev_err(&intf->dev, "Not able to get a minor for this device.\n");
 		usb_set_intfdata(intf, NULL);
 		goto error;
+	}
+
+	/* FIFO Setup */
+	ret = kfifo_alloc(&pic32_fifo, FIFO_SIZE, GFP_KERNEL);
+	if (ret) {
+		printk(KERN_ERR "pic32: error kfifo_alloc\n");
+		return ret;
+	}
+	dev->fifo = &pic32_fifo;
+
+	if (proc_create(PROC_FIFO, 0, NULL, &fifo_fops) == NULL) {
+	    printk("pic32: could't create fifo entry in procfs\n");
+	    return -ENOMEM;
 	}
 
 	dev_info(&intf->dev,
@@ -409,6 +525,8 @@ static void pic32_usb_disconnect(struct usb_interface *intf)
 		mutex_unlock(&dev->mutex);
 	}
 
+	remove_proc_entry(PROC_FIFO, NULL);
+	kfifo_free(&pic32_fifo);
 	dev_info(&intf->dev, "PIC32 USB Device #%d now disconnected\n",
 		 (minor - USB_PIC32_MINOR_BASE));
 }
