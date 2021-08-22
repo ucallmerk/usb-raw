@@ -15,9 +15,9 @@
 
 //Bus 001 Device 006: ID 04d8:003f Microchip Technology, Inc.
 #define MC_VENDOR_ID		0x04d8
-#define PIC_PRODUCT_ID		0x003f
+#define PIC_PRODUCT_ID		0x0055
 #define USB_PIC32_MINOR_BASE	0
-#define PIC32_INT_BUFF_SZ	64
+#define PIC32_INT_BUFF_SZ	128
 #define USB_CTRL_SET_TIMEOUT	5000
 
 
@@ -28,7 +28,8 @@ static struct kfifo pic32_fifo;
 #define FIFO_SIZE	256
 #define	PROC_FIFO	"pic32_input"
 #define KEY_BUTTON_LOC 	1
-#define NR_BUTTONS 8
+#define KEY_BYTES	3
+#define NR_BUTTONS 	24
 
 static DEFINE_MUTEX(fread_lock);
 
@@ -78,18 +79,19 @@ struct usb_pic32 {
 };
 
 
-static void pic32_usb_process_buffer(const char* buffer)
+static void pic32_usb_process_buffer(char* buffer)
 {
-	unsigned char buf;
-	unsigned char i,j;
-
-	buf = buffer[KEY_BUTTON_LOC];
-	for (i=0,j=0; i<8; i++) {
-		if((short)buf & (short)(1<<i)) {
-			ascii_buf[j++] = ascii_map_base + i;
-			key_pressed = true;
+	int i,j,k;
+	j=0;
+	for (k = 0; k < KEY_BYTES; k++) {
+		for (i=0; i<NR_BUTTONS; i++) {
+			if((short)buffer[k + KEY_BUTTON_LOC] & (short)(1<<i)) {
+				ascii_buf[j++] = ascii_map_base + i;
+				key_pressed = true;
+			}
 		}
 	}
+	ascii_buf[j] = "\n";
 	kfifo_in(&pic32_fifo, ascii_buf, j);
 }
 
@@ -97,7 +99,6 @@ static void pic32_usb_process_buffer(const char* buffer)
 
 ssize_t pic32_input_read(struct device *dev, struct device_attribute *attr,  char *buf)
 {
-	int i;
 
 	if(key_pressed) {
 		key_pressed = 0;
@@ -193,7 +194,7 @@ static int pic32_usb_open (struct inode *inode, struct file *file)
 			 udev,
 			 dev->in_pipe,
 			 dev->in_buff,
-			 dev->ep_in_maxp_sz,
+			 PIC32_INT_BUFF_SZ,,
 			 pic32_usb_read_callback,
 			 dev,
 			 in_intvl);
